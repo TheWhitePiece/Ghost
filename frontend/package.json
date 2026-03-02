@@ -1,0 +1,25 @@
+{
+  "name": "supply-chain-ghost-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.21.0",
+    "react-scripts": "5.0.1",
+    "@aws-amplify/ui-react": "^6.0.0",
+    "aws-amplify": "^6.0.0",
+    "recharts": "^2.10.0",
+    "lucide-react": "^0.300.0",
+    "date-fns": "^3.0.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test"
+  },
+  "browserslist": {
+    "production": [">0.2%", "not dead", "not op_mini all"],
+    "development": ["last 1 chrome version", "last 1 firefox version"]
+  }
+}
