@@ -266,13 +266,15 @@ def _execute_with_api_fallback(decision: dict, credentials: dict) -> dict:
 def handler(event, context):
     """
     Nova Act execution handler with self-healing retry logic.
-    
-    Retry strategy:
-    1. Try Nova Act browser automation
-    2. If UI fails, retry with alternate selectors
-    3. Fall back to ERP API mode
-    4. Escalate to human
+
+    Retry strategy (escalating):
+      Attempt 1 — preferred mode (nova_act or api, per EXECUTION_MODE)
+      Attempt 2 — same mode, after exponential backoff
+      Attempt 3 — opposite mode as last resort (nova_act ↔ api)
+    If all 3 fail → escalate to human.
     """
+    import time
+
     logger.info("NovaActExecutor invoked")
     start_time = datetime.now(timezone.utc)
 
@@ -289,36 +291,39 @@ def handler(event, context):
             "escalate": True,
         }
 
-    # ── Self-Healing Retry Loop ──
+    # ── Self-Healing Retry Loop (escalating strategy) ──
     result = None
     attempts = []
 
-    for attempt in range(MAX_RETRIES):
-        logger.info("Execution attempt %d/%d (mode=%s)", attempt + 1, MAX_RETRIES, EXECUTION_MODE)
+    # Build the attempt plan: [preferred, preferred, opposite]
+    opposite_mode = "api" if EXECUTION_MODE == "nova_act" else "nova_act"
+    attempt_modes = [EXECUTION_MODE, EXECUTION_MODE, opposite_mode]
+    backoff_secs = [0, 2, 4]  # exponential-ish: 0 s, 2 s, 4 s
 
-        # Try Nova Act first only if mode is "nova_act"
-        if EXECUTION_MODE == "nova_act":
+    for attempt_idx, mode in enumerate(attempt_modes):
+        attempt_num = attempt_idx + 1
+
+        # Exponential backoff between retries
+        if backoff_secs[attempt_idx] > 0:
+            logger.info("Backing off %ds before attempt %d", backoff_secs[attempt_idx], attempt_num)
+            time.sleep(backoff_secs[attempt_idx])
+
+        logger.info("Execution attempt %d/%d (mode=%s)", attempt_num, MAX_RETRIES, mode)
+
+        if mode == "nova_act":
             result = _execute_with_nova_act(decision, credentials)
-            if result and result.get("status") == "SUCCESS":
-                attempts.append({"attempt": attempt + 1, "method": "nova_act", "status": "SUCCESS"})
-                break
-            attempts.append({
-                "attempt": attempt + 1,
-                "method": "nova_act",
-                "status": "FAILED",
-                "error": result.get("error", "Nova Act unavailable") if result else "SDK not available",
-            })
+            method_label = "nova_act"
+        else:
+            result = _execute_with_api_fallback(decision, credentials)
+            method_label = "api"
 
-        # API fallback (or primary if mode == "api")
-        logger.info("Using ERP API mode")
-        result = _execute_with_api_fallback(decision, credentials)
         if result and result.get("status") == "SUCCESS":
-            attempts.append({"attempt": attempt + 1, "method": "api_fallback", "status": "SUCCESS"})
+            attempts.append({"attempt": attempt_num, "method": method_label, "status": "SUCCESS"})
             break
 
         attempts.append({
-            "attempt": attempt + 1,
-            "method": "api_fallback",
+            "attempt": attempt_num,
+            "method": method_label,
             "status": "FAILED",
             "error": result.get("error", "Unknown") if result else "Unknown",
         })

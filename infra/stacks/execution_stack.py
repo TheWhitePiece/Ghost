@@ -43,6 +43,10 @@ class ExecutionStack(cdk.Stack):
         )
 
         # ── Nova Act Execution Lambda ──
+        # For API-only mode: use _lambda.Function (ZIP, no Docker needed).
+        # For Nova Act browser mode: switch to _lambda.DockerImageFunction
+        # with _lambda.DockerImageCode.from_image_asset(...) and the Dockerfile
+        # in lambdas/execution/. Requires Docker Desktop running locally.
         self.nova_act_fn = _lambda.Function(
             self, "NovaActExecutor",
             function_name="SCG-NovaActExecutor",
@@ -56,6 +60,8 @@ class ExecutionStack(cdk.Stack):
                 "AUDIT_BUCKET": audit_bucket.bucket_name,
                 "ERP_SECRET_ARN": self.erp_secret.secret_arn,
                 "POWERTOOLS_SERVICE_NAME": "execution",
+                "EXECUTION_MODE": "api",  # Change to "nova_act" when using Docker image
+                "ERP_URL": "",  # MUST be overridden at deploy time or via console
             },
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(
@@ -64,7 +70,7 @@ class ExecutionStack(cdk.Stack):
             timeout=Duration.seconds(600),
             memory_size=4096,
             tracing=_lambda.Tracing.ACTIVE,
-            description="Nova Act browser automation for ERP",
+            description="ERP execution handler (API mode; switch to Docker for Nova Act)",
         )
         self.erp_secret.grant_read(self.nova_act_fn)
         risk_table.grant_read_write_data(self.nova_act_fn)
