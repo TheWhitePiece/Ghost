@@ -1,16 +1,19 @@
 """
 NovaActExecutor Lambda — Browser automation for ERP purchase order creation.
 
-Uses Nova Act to:
-1. Open ERP login
-2. Authenticate via Secrets Manager
-3. Navigate procurement module
-4. Search SKU, filter supplier
-5. Draft PO
-6. Take screenshot
-7. Save draft
+Supports two execution modes:
+  1. Nova Act browser automation (requires Docker container image with Chromium)
+  2. ERP REST API fallback (works in standard Lambda, requires ERP_URL + credentials)
 
-With self-healing retry logic and fallback API mode.
+Set ERP_URL to your real ERP endpoint (SAP, Oracle NetSuite, etc.) before deploy.
+For Nova Act mode, deploy as a container image using the included Dockerfile.
+
+Env vars:
+    RISK_TABLE       — DynamoDB risk assessments table
+    AUDIT_BUCKET     — S3 bucket for audit records / screenshots
+    ERP_SECRET_ARN   — Secrets Manager ARN with {username, password, api_key}
+    ERP_URL          — Base URL of the ERP system (REQUIRED for real operation)
+    EXECUTION_MODE   — "nova_act" or "api" (default: "api")
 """
 import os
 import json
@@ -34,7 +37,8 @@ AUDIT_BUCKET = os.environ["AUDIT_BUCKET"]
 ERP_SECRET_ARN = os.environ["ERP_SECRET_ARN"]
 
 MAX_RETRIES = 3
-ERP_BASE_URL = os.environ.get("ERP_URL", "https://erp.example.com")
+ERP_BASE_URL = os.environ.get("ERP_URL", "")
+EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "api")
 
 
 def _get_erp_credentials() -> dict:
@@ -177,9 +181,20 @@ def _execute_with_nova_act(decision: dict, credentials: dict) -> dict:
 
 def _execute_with_api_fallback(decision: dict, credentials: dict) -> dict:
     """
-    Fallback: Create PO via ERP REST API instead of browser automation.
+    Create PO via ERP REST API (works in standard Lambda).
+    Requires ERP_URL to be set to a real ERP endpoint.
     """
     import requests
+
+    if not ERP_BASE_URL or "example.com" in ERP_BASE_URL:
+        return {
+            "status": "FAILED",
+            "method": "api_fallback",
+            "error": (
+                "ERP_URL is not configured. Set the ERP_URL environment variable "
+                "to your real ERP endpoint (e.g. SAP, Oracle NetSuite, Coupa)."
+            ),
+        }
 
     assessment_id = decision.get("assessment_id", "unknown")
     supplier = decision.get("recommended_supplier", {})
@@ -279,23 +294,23 @@ def handler(event, context):
     attempts = []
 
     for attempt in range(MAX_RETRIES):
-        logger.info("Execution attempt %d/%d", attempt + 1, MAX_RETRIES)
+        logger.info("Execution attempt %d/%d (mode=%s)", attempt + 1, MAX_RETRIES, EXECUTION_MODE)
 
-        # Try Nova Act first
-        result = _execute_with_nova_act(decision, credentials)
-        if result and result.get("status") == "SUCCESS":
-            attempts.append({"attempt": attempt + 1, "method": "nova_act", "status": "SUCCESS"})
-            break
+        # Try Nova Act first only if mode is "nova_act"
+        if EXECUTION_MODE == "nova_act":
+            result = _execute_with_nova_act(decision, credentials)
+            if result and result.get("status") == "SUCCESS":
+                attempts.append({"attempt": attempt + 1, "method": "nova_act", "status": "SUCCESS"})
+                break
+            attempts.append({
+                "attempt": attempt + 1,
+                "method": "nova_act",
+                "status": "FAILED",
+                "error": result.get("error", "Nova Act unavailable") if result else "SDK not available",
+            })
 
-        attempts.append({
-            "attempt": attempt + 1,
-            "method": "nova_act",
-            "status": "FAILED",
-            "error": result.get("error", "Nova Act unavailable") if result else "SDK not available",
-        })
-
-        # Fallback to API
-        logger.info("Falling back to API mode")
+        # API fallback (or primary if mode == "api")
+        logger.info("Using ERP API mode")
         result = _execute_with_api_fallback(decision, credentials)
         if result and result.get("status") == "SUCCESS":
             attempts.append({"attempt": attempt + 1, "method": "api_fallback", "status": "SUCCESS"})

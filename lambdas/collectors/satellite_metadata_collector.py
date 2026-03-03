@@ -1,11 +1,21 @@
 """
-SatelliteMetadataCollector Lambda — Retrieves port satellite image metadata
-for visual verification by Nova 2 Omni.
+SatelliteMetadataCollector Lambda — Retrieves port satellite imagery and metadata
+for visual verification by Nova Premier.
+
+Uses Sentinel Hub (ESA Copernicus) free tier for Sentinel-2 imagery.
+Stores actual images to S3 at the path the verification engine expects.
+
+Env vars:
+    RAW_BUCKET                   — S3 bucket for raw data / images
+    SIGNALS_TABLE                — DynamoDB signals table
+    SENTINEL_HUB_CLIENT_ID       — Sentinel Hub OAuth client ID
+    SENTINEL_HUB_CLIENT_SECRET   — Sentinel Hub OAuth client secret
+    SENTINEL_HUB_INSTANCE_ID     — (optional) Sentinel Hub configuration instance
 """
 import os
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
 import boto3
@@ -19,6 +29,9 @@ DDB = boto3.resource("dynamodb")
 
 RAW_BUCKET = os.environ["RAW_BUCKET"]
 SIGNALS_TABLE = os.environ["SIGNALS_TABLE"]
+
+SENTINEL_CLIENT_ID = os.environ.get("SENTINEL_HUB_CLIENT_ID", "")
+SENTINEL_CLIENT_SECRET = os.environ.get("SENTINEL_HUB_CLIENT_SECRET", "")
 
 # Port areas of interest for satellite monitoring
 PORT_AOIS = [
@@ -50,37 +63,181 @@ PORT_AOIS = [
 ]
 
 
+# ── Sentinel Hub integration ────────────────────────────────────────────
+
+def _get_sentinel_token() -> str:
+    """Obtain OAuth2 token from Sentinel Hub."""
+    resp = requests.post(
+        "https://services.sentinel-hub.com/auth/realms/main/protocol/openid-connect/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": SENTINEL_CLIENT_ID,
+            "client_secret": SENTINEL_CLIENT_SECRET,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def _search_sentinel_catalog(bbox: list, token: str) -> dict | None:
+    """Search Sentinel Hub Catalog for recent Sentinel-2 scenes over the bbox."""
+    now = datetime.now(timezone.utc)
+    time_from = (now - timedelta(days=14)).strftime("%Y-%m-%dT00:00:00Z")
+    time_to = now.strftime("%Y-%m-%dT23:59:59Z")
+
+    search_body = {
+        "bbox": bbox,
+        "datetime": f"{time_from}/{time_to}",
+        "collections": ["sentinel-2-l2a"],
+        "limit": 5,
+        "filter": "eo:cloud_cover < 40",
+    }
+
+    resp = requests.post(
+        "https://services.sentinel-hub.com/api/v1/catalog/1.0.0/search",
+        json=search_body,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    features = resp.json().get("features", [])
+    if features:
+        # Return most recent, lowest cloud cover
+        features.sort(key=lambda f: f["properties"].get("eo:cloud_cover", 100))
+        return features[0]
+    return None
+
+
+def _download_sentinel_image(bbox: list, token: str, date_str: str) -> bytes | None:
+    """Download a true-color Sentinel-2 image via the Process API."""
+    evalscript = """
+//VERSION=3
+function setup() {
+  return { input: ["B04","B03","B02"], output: { bands: 3 } };
+}
+function evaluatePixel(sample) {
+  return [2.5*sample.B04, 2.5*sample.B03, 2.5*sample.B02];
+}
+"""
+    process_body = {
+        "input": {
+            "bounds": {
+                "bbox": bbox,
+                "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"},
+            },
+            "data": [{
+                "type": "sentinel-2-l2a",
+                "dataFilter": {
+                    "timeRange": {
+                        "from": f"{date_str}T00:00:00Z",
+                        "to": f"{date_str}T23:59:59Z",
+                    },
+                    "maxCloudCoverage": 40,
+                },
+            }],
+        },
+        "output": {
+            "width": 512, "height": 512,
+            "responses": [{"identifier": "default", "format": {"type": "image/png"}}],
+        },
+        "evalscript": evalscript,
+    }
+
+    resp = requests.post(
+        "https://services.sentinel-hub.com/api/v1/process",
+        json=process_body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "image/png",
+        },
+        timeout=30,
+    )
+    if resp.status_code == 200 and len(resp.content) > 1000:
+        return resp.content
+    logger.warning("Sentinel image download returned status %s / %d bytes",
+                    resp.status_code, len(resp.content))
+    return None
+
+
 def _fetch_satellite_metadata(aoi: dict) -> dict:
     """
-    Fetch recent satellite image metadata for an area of interest.
-    In production: integrate with Sentinel Hub, Planet, or Maxar APIs
-    for actual satellite imagery and vessel detection.
+    Fetch real satellite metadata + actual image for a port AOI.
+    Primary: Sentinel Hub (ESA, free tier).
+    Stores the image to S3 at satellite/{port_code}/{date}/image.png so
+    the verification engine can consume it.
     """
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    data_source = "unavailable"
+    image_bytes = None
+    catalog_entry = None
+    cloud_cover = 100.0
+
+    if SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET:
+        try:
+            token = _get_sentinel_token()
+
+            # 1. Search catalog for recent imagery
+            catalog_entry = _search_sentinel_catalog(aoi["bbox"], token)
+            if catalog_entry:
+                acq_date = catalog_entry["properties"].get("datetime", date_str)[:10]
+                cloud_cover = catalog_entry["properties"].get("eo:cloud_cover", 100.0)
+                data_source = "sentinel_hub"
+
+                # 2. Download actual image
+                image_bytes = _download_sentinel_image(aoi["bbox"], token, acq_date)
+                if image_bytes:
+                    # 3. Store to S3 at the path verification_engine expects
+                    s3_key = f"satellite/{aoi['port_code']}/{date_str}/image.png"
+                    S3.put_object(
+                        Bucket=RAW_BUCKET,
+                        Key=s3_key,
+                        Body=image_bytes,
+                        ContentType="image/png",
+                    )
+                    logger.info("Stored satellite image: s3://%s/%s (%d bytes)",
+                                RAW_BUCKET, s3_key, len(image_bytes))
+                else:
+                    logger.warning("Image download failed for %s", aoi["port_code"])
+        except Exception as e:
+            logger.warning("Sentinel Hub failed for %s: %s", aoi["port_code"], e)
+    else:
+        logger.warning("Sentinel Hub credentials not configured — no satellite imagery")
+
+    image_available = image_bytes is not None and len(image_bytes) > 1000
+
     return {
         "port_code": aoi["port_code"],
         "port_name": aoi["name"],
         "bbox": aoi["bbox"],
         "latest_image": {
-            "acquisition_date": datetime.now(timezone.utc).isoformat(),
-            "satellite": "Sentinel-2",
-            "resolution_m": 10,
-            "cloud_cover_pct": 15.0,
-            "image_id": f"S2_{aoi['port_code']}_{datetime.now(timezone.utc).strftime('%Y%m%d')}",
+            "acquisition_date": (catalog_entry["properties"]["datetime"]
+                                 if catalog_entry else datetime.now(timezone.utc).isoformat()),
+            "satellite": "Sentinel-2" if catalog_entry else "N/A",
+            "resolution_m": 10 if catalog_entry else 0,
+            "cloud_cover_pct": cloud_cover,
+            "image_id": (catalog_entry.get("id", "")
+                         if catalog_entry
+                         else f"NONE_{aoi['port_code']}_{date_str}"),
         },
+        # Vessel detection is deferred to the verification engine (Nova Premier multimodal)
         "vessel_detection": {
             "detected_vessels": 0,
             "vessels_at_anchor": 0,
             "vessels_in_transit": 0,
             "dock_occupancy_pct": 0.0,
             "movement_density_index": 0.0,
+            "detection_note": "Deferred to Nova Premier multimodal verification",
         },
         "change_detection": {
             "compared_to": "7_days_ago",
             "vessel_count_change_pct": 0.0,
             "dock_occupancy_change_pct": 0.0,
+            "detection_note": "Deferred to Nova Premier multimodal verification",
         },
-        "image_available_for_analysis": True,
-        "data_source": "simulated",
+        "image_available_for_analysis": image_available,
+        "image_size_bytes": len(image_bytes) if image_bytes else 0,
+        "data_source": data_source,
     }
 
 
@@ -107,12 +264,25 @@ def handler(event, context):
                 ContentType="application/json",
             )
 
-            # Check for anomalies
+            # If imagery is available, create a signal so the verification
+            # engine knows there is a fresh image to analyse with Nova Premier.
+            # Anomaly detection (vessel clustering, change detection) is
+            # performed by the multimodal verification engine, not here.
             vessel_change = metadata["change_detection"]["vessel_count_change_pct"]
             dock_change = metadata["change_detection"]["dock_occupancy_change_pct"]
 
-            if abs(vessel_change) >= 30 or abs(dock_change) >= 20:
+            create_signal = (
+                abs(vessel_change) >= 30
+                or abs(dock_change) >= 20
+                or metadata["image_available_for_analysis"]
+            )
+
+            if create_signal:
                 severity = "HIGH" if abs(vessel_change) >= 50 or abs(dock_change) >= 40 else "MEDIUM"
+                # If image is available but no change data yet, default to LOW
+                # so that the verification engine can still pick it up.
+                if abs(vessel_change) < 30 and abs(dock_change) < 20:
+                    severity = "LOW"
 
                 signal_id = f"satellite-{aoi['port_code'].lower()}-{ts[:10]}"
                 signal = {
@@ -120,11 +290,12 @@ def handler(event, context):
                     "timestamp": ts,
                     "signal_type": "SATELLITE",
                     "source": f"satellite:{aoi['port_code']}",
-                    "title": f"Satellite anomaly at {aoi['name']}",
+                    "title": f"Satellite image captured at {aoi['name']}",
                     "summary": (
+                        f"Fresh satellite image available for analysis. "
                         f"Vessel count change: {vessel_change:+.1f}%, "
                         f"Dock occupancy change: {dock_change:+.1f}%. "
-                        f"Detected vessels: {metadata['vessel_detection']['detected_vessels']}."
+                        f"Data source: {metadata['data_source']}."
                     ),
                     "severity": severity,
                     "port_code": aoi["port_code"],

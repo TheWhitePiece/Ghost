@@ -32,7 +32,7 @@
 │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐ │                 │
 │  │  │ Reason  │─▶│ Verify? │─▶│ Decide  │─▶│ Execute │ │                 │
 │  │  │ (Nova   │  │ (Nova   │  │ (Cost   │  │ (Nova   │ │                 │
-│  │  │  Lite)  │  │  Omni)  │  │  Math)  │  │  Act)   │ │                 │
+│  │  │  Lite)  │  │ Premier)│  │  Math)  │  │  Act)   │ │                 │
 │  │  └─────────┘  └─────────┘  └─────────┘  └────┬────┘ │                 │
 │  │                                                │      │                 │
 │  │                                          ┌─────▼────┐ │                 │
@@ -59,22 +59,22 @@
 
 - **5 Collectors** running every 30 minutes via EventBridge:
   - `news_collector` — RSS feeds with NLP keyword matching (25 supply chain keywords)
-  - `weather_collector` — NWS API severe weather alerts for 8 monitored regions
-  - `port_congestion_collector` — 10 major ports, congestion threshold analysis
-  - `commodity_price_collector` — 10 commodities with threshold-based alerting
-  - `satellite_metadata_collector` — 5 port AOIs with change detection
+  - `weather_collector` — NWS API (US) + Open-Meteo API (worldwide) for 8 monitored regions
+  - `port_congestion_collector` — 10 major ports via BarentsWatch AIS / MarineTraffic
+  - `commodity_price_collector` — 10 commodities via Alpha Vantage + Yahoo Finance
+  - `satellite_metadata_collector` — 5 port AOIs via Sentinel Hub (ESA Copernicus) with actual imagery stored to S3
 - **Output**: Signals stored in DynamoDB (`SCG_Signals`) and S3 (`scg-raw-signals`)
 
 ### Loop 2: Reasoning (Risk Assessment)
 
-- **Model**: Amazon Nova 2 Lite (`amazon.nova-lite-v2:0`) with extended thinking (4096 token budget)
+- **Model**: Amazon Nova Lite (`amazon.nova-lite-v1:0`) with extended thinking (4096 token budget)
 - **RAG**: Bedrock Knowledge Base retrieval for supplier history and playbooks
-- **Memory Context**: Supplier reliability scores, inventory status, revenue sensitivity
+- **Memory Context**: Supplier reliability scores from DynamoDB (`SCG_Suppliers`), inventory status, revenue sensitivity
 - **Output**: Structured risk assessment (score 0-100, confidence, delay estimate, financial impact, mitigation options)
 
 ### Loop 3: Verification (Multimodal Cross-Check)
 
-- **Model**: Amazon Nova 2 Omni / Premier (`amazon.nova-premier-v1:0`)
+- **Model**: Amazon Nova Premier (`amazon.nova-premier-v1:0`)
 - **Conditional**: Only triggered when risk score ≥ 60
 - **Capabilities**:
   - Port satellite image analysis (vessel clustering, dock occupancy, movement density)
@@ -87,9 +87,11 @@
   - `Delay Cost = (Delay Days × Revenue/Day) × Reliability Multiplier`
   - `Switch Cost = (Price Diff × Qty) + Expedited Freight`
   - Confidence gating: actions only when confidence ≥ 70%
-- **Nova Act**: Browser automation for ERP purchase order creation
+  - Supplier data loaded from DynamoDB (`SCG_Suppliers`) at runtime
+- **Nova Act**: Browser automation for ERP purchase order creation (Docker container mode)
   - 8-step workflow with self-healing retry (3 attempts)
-  - API fallback mode if browser automation fails
+  - ERP REST API fallback mode for standard Lambda deployment
+  - Set `ERP_URL` to your real ERP endpoint; set `EXECUTION_MODE` to `nova_act` or `api`
   - Screenshots saved to S3 for audit trail
 - **Human-in-the-Loop**: Step Functions `WAIT_FOR_TASK_TOKEN` for approval
   - Required for all actions with financial impact > threshold
@@ -99,7 +101,7 @@
 
 | Service                       | Purpose                                  |
 | ----------------------------- | ---------------------------------------- |
-| Amazon Bedrock (Nova 2 Lite)  | Risk reasoning with extended thinking    |
+| Amazon Bedrock (Nova Lite)    | Risk reasoning with extended thinking    |
 | Amazon Bedrock (Nova Premier) | Multimodal verification (satellite, BOL) |
 | Amazon Nova Act               | Browser automation for ERP operations    |
 | AWS Step Functions            | Visual pipeline orchestration            |
@@ -119,7 +121,7 @@
 ## Competition Categories
 
 1. **Agentic AI** — Strands Agents SDK orchestrating multi-step supply chain reasoning
-2. **Multimodal Understanding** — Nova 2 Omni analyzing satellite imagery + documents
+2. **Multimodal Understanding** — Nova Premier analyzing satellite imagery + documents
 3. **UI Automation** — Nova Act automating ERP purchase order workflow
 
 ## Security Architecture
@@ -131,6 +133,24 @@
 - **WAF**: AWS Managed Rules + Rate Limiting (1000 req/5min) on CloudFront
 - **Secrets Manager**: Encrypted ERP credentials with rotation support
 - **VPC Endpoints**: Private connectivity to S3, DynamoDB, Secrets Manager, Bedrock
+
+## Environment Variables
+
+The following external API keys / secrets must be set (via Lambda environment or Secrets Manager) for full functionality:
+
+| Variable                     | Used By                                         | Required | Notes                                             |
+| ---------------------------- | ----------------------------------------------- | -------- | ------------------------------------------------- |
+| `BARENTSWATCH_CLIENT_ID`     | port_congestion_collector                       | Yes      | Free — register at developer.barentswatch.no      |
+| `BARENTSWATCH_CLIENT_SECRET` | port_congestion_collector                       | Yes      | Free — same registration                          |
+| `MARINETRAFFIC_API_KEY`      | port_congestion_collector                       | No       | PS07 endpoint; fallback if BarentsWatch fails     |
+| `ALPHA_VANTAGE_API_KEY`      | commodity_price_collector                       | Yes      | Free tier — 25 requests/day at alphavantage.co    |
+| `SENTINEL_HUB_CLIENT_ID`     | satellite_metadata_collector                    | Yes      | Free trial at apps.sentinel-hub.com               |
+| `SENTINEL_HUB_CLIENT_SECRET` | satellite_metadata_collector                    | Yes      | Free trial — same registration                    |
+| `OPENWEATHERMAP_API_KEY`     | weather_collector                               | No       | Optional enhanced fallback; Open-Meteo is primary |
+| `ERP_URL`                    | nova_act_executor                               | Yes\*    | Your real ERP base URL; required if executing POs |
+| `EXECUTION_MODE`             | nova_act_executor                               | No       | `api` (default) or `nova_act` (Docker + Chromium) |
+| `KNOWLEDGE_BASE_ID`          | reasoning_engine                                | No       | Bedrock Knowledge Base ID; RAG disabled if empty  |
+| `SUPPLIERS_TABLE`            | decision_engine, reasoning_engine, memory_tools | No       | Defaults to `SCG_Suppliers`                       |
 
 ## Deployment
 

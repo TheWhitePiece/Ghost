@@ -1,8 +1,10 @@
 """
-ReasoningEngine Lambda — Nova 2 Lite Extended Thinking for risk assessment.
+ReasoningEngine Lambda — Nova Lite Extended Thinking for risk assessment.
 
 This is the brain of the system: it takes in signals, RAG context, and memory
 to produce structured risk assessments with full thought traces.
+
+Uses Amazon Nova Lite (v1) with extended thinking (4096 token budget).
 """
 import os
 import json
@@ -22,8 +24,16 @@ CW = boto3.client("cloudwatch")
 
 SIGNALS_TABLE = os.environ["SIGNALS_TABLE"]
 RISK_TABLE = os.environ["RISK_TABLE"]
-KNOWLEDGE_BUCKET = os.environ["KNOWLEDGE_BUCKET"]
+KNOWLEDGE_BUCKET = os.environ.get("KNOWLEDGE_BUCKET", "")
+KNOWLEDGE_BASE_ID = os.environ.get("KNOWLEDGE_BASE_ID", "")
 NOVA_MODEL_ID = os.environ.get("NOVA_MODEL_ID", "amazon.nova-lite-v1:0")
+
+# Validate Knowledge Base ID at import time
+if not KNOWLEDGE_BASE_ID:
+    logger.warning(
+        "KNOWLEDGE_BASE_ID is not set. RAG retrieval will be unavailable. "
+        "Run scripts/seed_knowledge_base.py and set the env var in CDK."
+    )
 
 SYSTEM_PROMPT = """You are the Supply Chain Ghost — an enterprise AI risk analyst.
 
@@ -66,10 +76,13 @@ def _fetch_recent_signals(hours: int = 6) -> list:
 
 def _retrieve_rag_context(query: str) -> str:
     """Retrieve relevant context from Bedrock Knowledge Base."""
+    if not KNOWLEDGE_BASE_ID:
+        logger.warning("KNOWLEDGE_BASE_ID not configured — skipping RAG retrieval")
+        return "No historical context available (Knowledge Base not configured)."
+
     try:
-        # Try to use Bedrock Knowledge Base if configured
         response = BEDROCK_AGENT.retrieve(
-            knowledgeBaseId=os.environ.get("KNOWLEDGE_BASE_ID", ""),
+            knowledgeBaseId=KNOWLEDGE_BASE_ID,
             retrievalQuery={"text": query},
             retrievalConfiguration={
                 "vectorSearchConfiguration": {
@@ -88,31 +101,43 @@ def _retrieve_rag_context(query: str) -> str:
         return "No historical context available from knowledge base."
 
 
+SUPPLIERS_TABLE = os.environ.get("SUPPLIERS_TABLE", "SCG_Suppliers")
+
+
 def _get_memory_context() -> str:
-    """Retrieve supplier memory/historical context."""
-    # In production, use Bedrock Memory API
-    return """
-SUPPLIER MEMORY (Historical):
-- Supplier A (Shenzhen Electronics Co): Reliability 62%. 
-  2025 Hurricane Florida: 12-day delay. 2025 Port strike: 9-day delay.
-- Supplier B (Taiwan Semiconductor): Reliability 85%.
-  2025 Chip shortage: 5-day delay. Generally reliable.
-- Supplier C (Rotterdam Logistics): Reliability 78%.
-  2025 Suez disruption: 15-day delay. Good recovery speed.
-- Supplier D (Vietnam Manufacturing): Reliability 71%.
-  2025 Monsoon season: 8-day delay. Improving trend.
+    """Retrieve supplier memory/historical context from DynamoDB."""
+    lines = ["SUPPLIER MEMORY (Historical):"]
+    try:
+        table = DDB.Table(SUPPLIERS_TABLE)
+        resp = table.scan()
+        for item in resp.get("Items", []):
+            sid = item.get("supplier_id", "Unknown")
+            name = item.get("name", "")
+            score = item.get("reliability_score", "?")
+            notes = item.get("notes", "")
+            history = item.get("history", [])
+            events_str = "; ".join(
+                f"{h.get('event','?')}: {h.get('delay_days','?')}-day delay"
+                for h in history
+            )
+            lines.append(f"- {sid} ({name}): Reliability {score}%. {events_str}. {notes}")
+    except Exception as e:
+        logger.warning("Failed to read supplier memory from DDB: %s", e)
+        lines.append("- (Supplier memory unavailable)")
 
-INVENTORY STATUS:
-- SKU-001 (Microcontrollers): 14 days supply remaining
-- SKU-002 (Display Panels): 21 days supply remaining
-- SKU-003 (Battery Cells): 7 days supply remaining (CRITICAL)
-- SKU-004 (Chassis Components): 30 days supply remaining
+    lines.append("")
+    lines.append("INVENTORY STATUS:")
+    lines.append("- SKU-001 (Microcontrollers): 14 days supply remaining")
+    lines.append("- SKU-002 (Display Panels): 21 days supply remaining")
+    lines.append("- SKU-003 (Battery Cells): 7 days supply remaining (CRITICAL)")
+    lines.append("- SKU-004 (Chassis Components): 30 days supply remaining")
+    lines.append("")
+    lines.append("REVENUE SENSITIVITY:")
+    lines.append("- Product Line Alpha: $125,000/day revenue impact per day of delay")
+    lines.append("- Product Line Beta: $85,000/day")
+    lines.append("- Product Line Gamma: $45,000/day")
 
-REVENUE SENSITIVITY:
-- Product Line Alpha: $125,000/day revenue impact per day of delay
-- Product Line Beta: $85,000/day
-- Product Line Gamma: $45,000/day
-"""
+    return "\n".join(lines)
 
 
 def _invoke_nova_reasoning(signals: list, rag_context: str, memory: str) -> dict:
@@ -153,7 +178,13 @@ Return your analysis as a JSON object with these exact fields:
         "system": [{"text": SYSTEM_PROMPT}],
         "inferenceConfig": {
             "maxTokens": 8192,
-            "temperature": 0.2,
+            "temperature": 1.0,  # Must be 1.0 when extended thinking is enabled
+        },
+        "additionalModelRequestFields": {
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 4096,
+            }
         },
     }
 
@@ -201,15 +232,33 @@ def handler(event, context):
     # 4. Invoke Nova 2 Lite
     nova_response = _invoke_nova_reasoning(signals, rag_context, memory_context)
 
-    # 5. Parse response
+    # 5. Parse response — handle extended thinking output format
     try:
-        output_text = nova_response["output"]["message"]["content"][0]["text"]
+        content_blocks = nova_response["output"]["message"]["content"]
+        # Extended thinking returns [{"thinking": ...}, {"text": ...}]
+        # Extract the text block (skip thinking blocks)
+        output_text = ""
+        thinking_text = ""
+        for block in content_blocks:
+            if "text" in block:
+                output_text = block["text"]
+            elif "thinking" in block:
+                thinking_text = block["thinking"]
+
+        if not output_text:
+            # Fallback: try legacy format
+            output_text = content_blocks[0].get("text", "")
+
         # Extract JSON from response
         if "```json" in output_text:
             output_text = output_text.split("```json")[1].split("```")[0]
         elif "```" in output_text:
             output_text = output_text.split("```")[1].split("```")[0]
         assessment = json.loads(output_text)
+
+        # Store thinking trace for audit
+        if thinking_text:
+            assessment["_thinking_trace"] = thinking_text[:2000]
     except (json.JSONDecodeError, KeyError, IndexError) as e:
         logger.error("Failed to parse Nova response: %s", str(e))
         assessment = {

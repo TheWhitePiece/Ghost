@@ -42,13 +42,14 @@ perception_stack = PerceptionStack(
     env=env,
 )
 
-# --- 5. Reasoning Layer (Nova 2 Lite + RAG + Memory) ---
+# --- 5. Reasoning Layer (Nova Lite + RAG + Memory) ---
 reasoning_stack = ReasoningStack(
     app, f"{project}-Reasoning",
     vpc=vpc_stack.vpc,
     signals_table=storage_stack.signals_table,
     risk_table=storage_stack.risk_table,
     knowledge_bucket=storage_stack.knowledge_bucket,
+    suppliers_table=storage_stack.suppliers_table,
     env=env,
 )
 

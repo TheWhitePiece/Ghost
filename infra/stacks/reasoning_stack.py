@@ -23,6 +23,7 @@ class ReasoningStack(cdk.Stack):
         signals_table: dynamodb.Table,
         risk_table: dynamodb.Table,
         knowledge_bucket: s3.Bucket,
+        suppliers_table: dynamodb.Table = None,
         **kwargs,
     ):
         super().__init__(scope, construct_id, **kwargs)
@@ -57,6 +58,8 @@ class ReasoningStack(cdk.Stack):
                 "SIGNALS_TABLE": signals_table.table_name,
                 "RISK_TABLE": risk_table.table_name,
                 "KNOWLEDGE_BUCKET": knowledge_bucket.bucket_name,
+                "SUPPLIERS_TABLE": suppliers_table.table_name if suppliers_table else "SCG_Suppliers",
+                "KNOWLEDGE_BASE_ID": "",  # Set after running seed_knowledge_base.py
                 "NOVA_MODEL_ID": "amazon.nova-lite-v1:0",
                 "POWERTOOLS_SERVICE_NAME": "reasoning",
             },
@@ -67,12 +70,14 @@ class ReasoningStack(cdk.Stack):
             timeout=Duration.seconds(300),
             memory_size=2048,
             tracing=_lambda.Tracing.ACTIVE,
-            description="Nova 2 Lite reasoning with extended thinking",
+            description="Nova Lite reasoning with extended thinking",
         )
         self.reasoning_fn.add_to_role_policy(bedrock_policy)
         signals_table.grant_read_data(self.reasoning_fn)
         risk_table.grant_read_write_data(self.reasoning_fn)
         knowledge_bucket.grant_read(self.reasoning_fn)
+        if suppliers_table:
+            suppliers_table.grant_read_data(self.reasoning_fn)
 
         # ── Verification Lambda (Nova 2 Omni Multimodal) ──
         self.verification_fn = _lambda.Function(
@@ -85,6 +90,7 @@ class ReasoningStack(cdk.Stack):
             ),
             environment={
                 "RISK_TABLE": risk_table.table_name,
+                "RAW_BUCKET": knowledge_bucket.bucket_name,
                 "NOVA_OMNI_MODEL_ID": "amazon.nova-premier-v1:0",
                 "POWERTOOLS_SERVICE_NAME": "verification",
             },
@@ -95,7 +101,7 @@ class ReasoningStack(cdk.Stack):
             timeout=Duration.seconds(300),
             memory_size=3072,
             tracing=_lambda.Tracing.ACTIVE,
-            description="Nova 2 Omni multimodal verification",
+            description="Nova Premier multimodal verification",
         )
         self.verification_fn.add_to_role_policy(bedrock_policy)
         risk_table.grant_read_write_data(self.verification_fn)
@@ -111,6 +117,7 @@ class ReasoningStack(cdk.Stack):
             ),
             environment={
                 "RISK_TABLE": risk_table.table_name,
+                "SUPPLIERS_TABLE": suppliers_table.table_name if suppliers_table else "SCG_Suppliers",
                 "POWERTOOLS_SERVICE_NAME": "decision",
             },
             vpc=vpc,
@@ -123,6 +130,8 @@ class ReasoningStack(cdk.Stack):
             description="Cost-based decision engine",
         )
         risk_table.grant_read_write_data(self.decision_fn)
+        if suppliers_table:
+            suppliers_table.grant_read_write_data(self.decision_fn)
 
         # ── Outputs ──
         cdk.CfnOutput(self, "ReasoningFnArn", value=self.reasoning_fn.function_arn)

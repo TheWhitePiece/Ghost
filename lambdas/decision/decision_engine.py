@@ -5,6 +5,9 @@ Implements the decision formula:
   Expected Delay Cost = (Estimated Delay Days × Revenue Loss Per Day) × Reliability Risk Multiplier
   Switch Cost = (New Supplier Price - Old Supplier Price) × Quantity + Expedited Freight
   If Delay Cost > Switch Cost → Act.
+
+Reads supplier data from DynamoDB (SCG_Suppliers) at invocation time so that
+runtime updates (new suppliers, changed prices) don't require redeployment.
 """
 import os
 import json
@@ -19,10 +22,12 @@ logger.setLevel(logging.INFO)
 
 DDB = boto3.resource("dynamodb")
 RISK_TABLE = os.environ["RISK_TABLE"]
+SUPPLIERS_TABLE = os.environ.get("SUPPLIERS_TABLE", "SCG_Suppliers")
 
-# ── Supplier Database (in production: from DynamoDB/Aurora) ──
-SUPPLIERS = {
+# ── Default supplier seed data (written to DDB on first invocation if empty) ──
+_DEFAULT_SUPPLIERS = {
     "Supplier A": {
+        "supplier_id": "Supplier A",
         "name": "Shenzhen Electronics Co",
         "reliability_score": 0.62,
         "unit_price": 45.00,
@@ -31,6 +36,7 @@ SUPPLIERS = {
         "port": "CNSZN",
     },
     "Supplier B": {
+        "supplier_id": "Supplier B",
         "name": "Taiwan Semiconductor",
         "reliability_score": 0.85,
         "unit_price": 52.00,
@@ -39,6 +45,7 @@ SUPPLIERS = {
         "port": "TWKHH",
     },
     "Supplier C": {
+        "supplier_id": "Supplier C",
         "name": "Rotterdam Logistics",
         "reliability_score": 0.78,
         "unit_price": 48.00,
@@ -47,6 +54,7 @@ SUPPLIERS = {
         "port": "NLRTM",
     },
     "Supplier D": {
+        "supplier_id": "Supplier D",
         "name": "Vietnam Manufacturing",
         "reliability_score": 0.71,
         "unit_price": 40.00,
@@ -55,6 +63,34 @@ SUPPLIERS = {
         "port": "VNSGN",
     },
 }
+
+
+def _load_suppliers() -> dict:
+    """Load supplier data from DynamoDB.  Seeds default data if table is empty."""
+    table = DDB.Table(SUPPLIERS_TABLE)
+    resp = table.scan()
+    items = resp.get("Items", [])
+
+    if not items:
+        # Seed defaults
+        logger.info("Seeding default supplier data into %s", SUPPLIERS_TABLE)
+        for data in _DEFAULT_SUPPLIERS.values():
+            item = json.loads(json.dumps(data, default=str), parse_float=Decimal)
+            table.put_item(Item=item)
+        items = list(_DEFAULT_SUPPLIERS.values())
+
+    suppliers = {}
+    for item in items:
+        sid = item.get("supplier_id", "")
+        suppliers[sid] = {
+            "name": str(item.get("name", "")),
+            "reliability_score": float(item.get("reliability_score", 0.5)),
+            "unit_price": float(item.get("unit_price", 0)),
+            "lead_time_days": int(item.get("lead_time_days", 14)),
+            "region": str(item.get("region", "")),
+            "port": str(item.get("port", "")),
+        }
+    return suppliers
 
 # Revenue sensitivity per product line
 REVENUE_PER_DAY = {
@@ -66,7 +102,7 @@ REVENUE_PER_DAY = {
 # Default parameters
 DEFAULT_QUANTITY = 5000
 EXPEDITED_FREIGHT_BASE = 15000
-CONFIDENCE_THRESHOLD = 50
+CONFIDENCE_THRESHOLD = 70   # Matches architecture doc: actions only at ≥ 70%
 RISK_SCORE_ACT_THRESHOLD = 40
 
 
@@ -88,12 +124,12 @@ def _calculate_switch_cost(
     return max(0, price_diff_cost + freight)
 
 
-def _find_best_alternative(affected_suppliers: list, assessment: dict) -> dict:
+def _find_best_alternative(affected_suppliers: list, assessment: dict, suppliers: dict) -> dict:
     """Find the best alternative supplier based on cost and reliability."""
     affected_names = [s.lower() for s in affected_suppliers]
     alternatives = []
 
-    for name, info in SUPPLIERS.items():
+    for name, info in suppliers.items():
         if name.lower() not in affected_names:
             alternatives.append({
                 "supplier_name": name,
@@ -113,12 +149,16 @@ def handler(event, context):
     """
     logger.info("DecisionEngine invoked")
 
+    # Load suppliers from DynamoDB (runtime-configurable)
+    suppliers = _load_suppliers()
+
     # Get assessment data (from Step Functions or direct)
     assessment = event.get("verification", event.get("reasoning", event))
     risk_score = float(assessment.get("verified_risk_score", assessment.get("risk_score", 0)))
     confidence = float(assessment.get("confidence_pct", 0))
     delay_days = int(assessment.get("estimated_delay_days", 0))
     affected_suppliers = assessment.get("affected_suppliers", [])
+    affected_skus = assessment.get("affected_skus", [])
     recommendation = assessment.get("action_recommendation", "MONITOR")
 
     # ── Confidence Gate ──
@@ -149,17 +189,17 @@ def handler(event, context):
     # Find affected supplier details
     primary_supplier = None
     for name in affected_suppliers:
-        if name in SUPPLIERS:
-            primary_supplier = SUPPLIERS[name]
+        if name in suppliers:
+            primary_supplier = suppliers[name]
             primary_supplier["supplier_key"] = name
             break
 
     if not primary_supplier:
-        primary_supplier = SUPPLIERS.get("Supplier A", {})
+        primary_supplier = suppliers.get("Supplier A", {})
         primary_supplier["supplier_key"] = "Supplier A"
 
     # Find best alternative
-    alternative = _find_best_alternative(affected_suppliers, assessment)
+    alternative = _find_best_alternative(affected_suppliers, assessment, suppliers)
 
     if not alternative:
         decision = {
@@ -190,6 +230,7 @@ def handler(event, context):
         "risk_score": risk_score,
         "confidence_pct": confidence,
         "estimated_delay_days": delay_days,
+        "affected_skus": affected_skus,  # Forward from reasoning → executor
         "requires_human": should_switch,  # Switching always needs approval
 
         # Cost breakdown
